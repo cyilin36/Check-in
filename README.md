@@ -61,7 +61,7 @@ python checkin.py once
 | `YNGAL_EMAIL` | 无 | yngal 邮箱，与 `YNGAL_PASSWORD` 同时设置后启用 |
 | `YNGAL_PASSWORD` | 无 | yngal 密码 |
 | `TZ` | `Asia/Shanghai` | 调度时区 |
-| `CHECKIN_TIME` | `08:00` | 绯月每日执行时间，格式为 `HH:MM` |
+| `KF_CHECKIN_TIME` | `08:00` | 绯月每日执行时间，格式为 `HH:MM` |
 | `YNGAL_CHECKIN_TIME` | `08:00` | yngal 每日执行时间，格式为 `HH:MM` |
 | `REQUEST_TIMEOUT` | `20` | 单次 HTTP 请求超时秒数 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |

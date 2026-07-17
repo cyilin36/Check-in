@@ -62,7 +62,7 @@ class Config:
         username = os.getenv("KF_USERNAME", "").strip()
         password = os.getenv("KF_PASSWORD", "")
         timezone_name = os.getenv("TZ", "Asia/Shanghai").strip()
-        checkin_time_text = os.getenv("CHECKIN_TIME", "08:00").strip()
+        checkin_time_text = os.getenv("KF_CHECKIN_TIME", "08:00").strip()
 
         if not username or not password:
             raise ValueError("KF_USERNAME 和 KF_PASSWORD 必须在 .env 或环境变量中设置")
@@ -73,7 +73,7 @@ class Config:
         try:
             checkin_time = datetime.strptime(checkin_time_text, "%H:%M").time()
         except ValueError as exc:
-            raise ValueError("CHECKIN_TIME 必须使用 HH:MM 格式，例如 08:00") from exc
+            raise ValueError("KF_CHECKIN_TIME 必须使用 HH:MM 格式，例如 08:00") from exc
 
         timeout_text = os.getenv("REQUEST_TIMEOUT", "20").strip()
         try:
@@ -147,7 +147,7 @@ class AppConfig:
                 forum_credentials[0],
                 forum_credentials[1],
                 timezone,
-                parse_time("CHECKIN_TIME"),
+                parse_time("KF_CHECKIN_TIME"),
                 timeout,
             )
 

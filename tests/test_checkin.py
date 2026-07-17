@@ -389,7 +389,7 @@ def test_app_config_enables_sites_independently_with_separate_times() -> None:
         {
             "KF_USERNAME": "forum-user",
             "KF_PASSWORD": "forum-password",
-            "CHECKIN_TIME": "07:30",
+            "KF_CHECKIN_TIME": "07:30",
             "TZ": "Asia/Shanghai",
         }
     )
