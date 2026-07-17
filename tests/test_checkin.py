@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import threading
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -7,6 +11,7 @@ import pytest
 import requests
 
 from checkin import (
+    AppConfig,
     AuthenticationError,
     CheckinResult,
     CheckinStatus,
@@ -14,12 +19,20 @@ from checkin import (
     ForumClient,
     ForumError,
     RewardState,
+    SiteJob,
+    YngalClient,
+    YngalConfig,
+    build_site_jobs,
     decode_html,
     find_account_url,
     is_login_page,
     is_safe_forum_url,
+    is_safe_yngal_url,
     next_scheduled_run,
+    once_exit_code,
     parse_reward_page,
+    run_all_once,
+    run_site_once,
     run_with_retries,
 )
 
@@ -35,9 +48,11 @@ class FakeSession:
         self.headers: dict[str, str] = {}
         self.calls: list[tuple[str, str]] = []
         self.post_kwargs: dict[str, object] | None = None
+        self.get_kwargs: list[dict[str, object]] = []
 
-    def get(self, url: str, **_kwargs: object) -> requests.Response:
+    def get(self, url: str, **kwargs: object) -> requests.Response:
         self.calls.append(("GET", url))
+        self.get_kwargs.append(kwargs)
         return next(self.responses)
 
     def post(self, url: str, **kwargs: object) -> requests.Response:
@@ -54,8 +69,23 @@ def make_response(html: str, url: str = "https://bbs.kfpromax.com/index.php") ->
     return response
 
 
+def make_json_response(payload: object, url: str) -> requests.Response:
+    response = requests.Response()
+    response.status_code = 200
+    response.url = url
+    response.headers["Content-Type"] = "application/json"
+    response._content = json.dumps(payload).encode("utf-8")
+    return response
+
+
 def make_config() -> Config:
     return Config("test-user", "test-password", ZoneInfo("Asia/Shanghai"), time(8, 0))
+
+
+def make_yngal_config() -> YngalConfig:
+    return YngalConfig(
+        "user@example.com", "test-password", ZoneInfo("Asia/Shanghai"), time(8, 0)
+    )
 
 
 def test_decode_gbk_page() -> None:
@@ -225,3 +255,216 @@ def test_next_run_today_or_tomorrow() -> None:
     after = datetime(2026, 7, 17, 8, 30, tzinfo=tz)
     assert next_scheduled_run(before, time(8, 0)) == datetime(2026, 7, 17, 8, 0, tzinfo=tz)
     assert next_scheduled_run(after, time(8, 0)) == datetime(2026, 7, 18, 8, 0, tzinfo=tz)
+
+
+def test_yngal_login_and_claim_reward() -> None:
+    login = make_json_response(
+        {
+            "code": 0,
+            "obj": {
+                "token": "secret-token",
+                "nickname": "tester",
+                "vstatus": "1",
+            },
+        },
+        "https://www.yngal.com/sign",
+    )
+    reward = make_json_response({"code": 0}, "https://www.yngal.com/addJf")
+    session = FakeSession([login, reward])
+
+    result = YngalClient(make_yngal_config(), session=session).checkin()
+
+    assert result.status is CheckinStatus.CLAIMED
+    assert result.reward_text == "硬币 +2"
+    assert session.calls == [
+        ("POST", "https://www.yngal.com/sign"),
+        ("GET", "https://www.yngal.com/addJf"),
+    ]
+    assert session.post_kwargs is not None
+    form = session.post_kwargs["data"]
+    assert isinstance(form, dict)
+    assert form == {
+        "email": "user@example.com",
+        "password": hashlib.md5(
+            b"test-password", usedforsecurity=False
+        ).hexdigest(),
+    }
+    assert session.get_kwargs[0]["headers"] == {"X-Auth-Token": "secret-token"}
+
+
+def test_yngal_already_claimed_is_success() -> None:
+    session = FakeSession(
+        [
+            make_json_response(
+                {"code": 0, "obj": {"token": "token", "vstatus": 0}},
+                "https://www.yngal.com/sign",
+            ),
+            make_json_response({"code": 10}, "https://www.yngal.com/addJf"),
+        ]
+    )
+    result = YngalClient(make_yngal_config(), session=session).checkin()
+    assert result.status is CheckinStatus.ALREADY_CLAIMED
+
+
+def test_yngal_wrong_password_is_non_retryable() -> None:
+    session = FakeSession(
+        [make_json_response({"code": 1}, "https://www.yngal.com/sign")]
+    )
+    result = YngalClient(make_yngal_config(), session=session).checkin()
+    assert result.status is CheckinStatus.FAILED
+    assert result.retryable is False
+    assert "账号和密码" in result.message
+
+
+def test_yngal_expired_token_is_retryable() -> None:
+    session = FakeSession(
+        [
+            make_json_response(
+                {"code": 0, "obj": {"token": "token"}},
+                "https://www.yngal.com/sign",
+            ),
+            make_json_response({"code": 119}, "https://www.yngal.com/addJf"),
+        ]
+    )
+    result = YngalClient(make_yngal_config(), session=session).checkin()
+    assert result.status is CheckinStatus.FAILED
+    assert result.retryable is True
+    assert "登录状态失效" in result.message
+
+
+def test_yngal_malformed_json_is_safe_retryable_failure() -> None:
+    response = requests.Response()
+    response.status_code = 200
+    response.url = "https://www.yngal.com/sign"
+    response._content = b"not-json"
+    result = YngalClient(make_yngal_config(), session=FakeSession([response])).checkin()
+    assert result.status is CheckinStatus.FAILED
+    assert result.retryable is True
+    assert "无法解析" in result.message
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://www.yngal.com/sign", True),
+        ("https://www.yngal.com:443/addJf", True),
+        ("http://www.yngal.com/sign", False),
+        ("https://yngal.com/sign", False),
+        ("https://www.yngal.com.evil.example/sign", False),
+        ("https://user:pass@www.yngal.com/sign", False),
+    ],
+)
+def test_safe_yngal_url(url: str, expected: bool) -> None:
+    assert is_safe_yngal_url(url) is expected
+
+
+def test_yngal_logs_do_not_contain_secrets(caplog: pytest.LogCaptureFixture) -> None:
+    session = FakeSession(
+        [
+            make_json_response(
+                {"code": 0, "obj": {"token": "secret-token"}},
+                "https://www.yngal.com/sign",
+            ),
+            make_json_response({"code": 0}, "https://www.yngal.com/addJf"),
+        ]
+    )
+    config = make_yngal_config()
+    job = SiteJob(
+        "yngal",
+        config.timezone,
+        config.checkin_time,
+        lambda site_log: YngalClient(config, session=session, logger=site_log).checkin(),
+    )
+    logger = logging.getLogger("test-secret-logging")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        run_site_once(job, logger, retry_delays=())
+    digest = hashlib.md5(b"test-password", usedforsecurity=False).hexdigest()
+    assert "test-password" not in caplog.text
+    assert digest not in caplog.text
+    assert "secret-token" not in caplog.text
+
+
+def test_app_config_enables_sites_independently_with_separate_times() -> None:
+    forum_only = AppConfig.from_mapping(
+        {
+            "KF_USERNAME": "forum-user",
+            "KF_PASSWORD": "forum-password",
+            "CHECKIN_TIME": "07:30",
+            "TZ": "Asia/Shanghai",
+        }
+    )
+    assert forum_only.forum is not None
+    assert forum_only.forum.checkin_time == time(7, 30)
+    assert forum_only.yngal is None
+
+    yngal_only = AppConfig.from_mapping(
+        {
+            "YNGAL_EMAIL": "user@example.com",
+            "YNGAL_PASSWORD": "password",
+            "YNGAL_CHECKIN_TIME": "09:15",
+            "TZ": "Asia/Shanghai",
+        }
+    )
+    assert yngal_only.forum is None
+    assert yngal_only.yngal is not None
+    assert yngal_only.yngal.checkin_time == time(9, 15)
+
+    both = AppConfig.from_mapping(
+        {
+            "KF_USERNAME": "forum-user",
+            "KF_PASSWORD": "forum-password",
+            "YNGAL_EMAIL": "user@example.com",
+            "YNGAL_PASSWORD": "password",
+            "TZ": "Asia/Shanghai",
+        }
+    )
+    assert both.forum is not None and both.forum.checkin_time == time(8, 0)
+    assert both.yngal is not None and both.yngal.checkin_time == time(8, 0)
+    assert [job.name for job in build_site_jobs(both)] == ["绯月", "yngal"]
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"KF_USERNAME": "user"},
+        {"KF_PASSWORD": "password"},
+        {"YNGAL_EMAIL": "user@example.com"},
+        {"YNGAL_PASSWORD": "password"},
+    ],
+)
+def test_app_config_rejects_missing_or_partial_credentials(env: dict[str, str]) -> None:
+    with pytest.raises(ValueError):
+        AppConfig.from_mapping(env)
+
+
+def test_run_all_once_does_not_block_one_site_behind_another() -> None:
+    slow_started = threading.Event()
+    fast_finished = threading.Event()
+
+    def slow_operation(_logger: object) -> CheckinResult:
+        slow_started.set()
+        assert fast_finished.wait(timeout=1)
+        return CheckinResult(CheckinStatus.CLAIMED, "slow ok")
+
+    def fast_operation(_logger: object) -> CheckinResult:
+        assert slow_started.wait(timeout=1)
+        fast_finished.set()
+        return CheckinResult(CheckinStatus.CLAIMED, "fast ok")
+
+    tz = ZoneInfo("Asia/Shanghai")
+    jobs = [
+        SiteJob("slow", tz, time(8, 0), slow_operation),
+        SiteJob("fast", tz, time(8, 0), fast_operation),
+    ]
+    results = run_all_once(jobs, logging.getLogger("test-parallel"))
+    assert list(results) == ["slow", "fast"]
+    assert all(result.status is CheckinStatus.CLAIMED for result in results.values())
+
+
+def test_once_exit_code_reports_any_site_failure() -> None:
+    success = CheckinResult(CheckinStatus.CLAIMED, "ok")
+    already = CheckinResult(CheckinStatus.ALREADY_CLAIMED, "already")
+    failed = CheckinResult(CheckinStatus.FAILED, "failed")
+    assert once_exit_code({"绯月": success, "yngal": already}) == 0
+    assert once_exit_code({"绯月": success, "yngal": failed}) == 1
