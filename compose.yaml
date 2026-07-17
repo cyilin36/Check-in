@@ -4,7 +4,7 @@ services:
   kf-checkin:
     build:
       context: .
-    image: kf-checkin:local
+    image: checkin:local
     restart: unless-stopped
     env_file:
       - .env
