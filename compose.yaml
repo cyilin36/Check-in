@@ -1,0 +1,12 @@
+name: kf-checkin
+
+services:
+  kf-checkin:
+    build:
+      context: .
+    image: kf-checkin:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
