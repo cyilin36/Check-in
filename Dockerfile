@@ -10,7 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY checkin.py ./
 
-RUN useradd --create-home --uid 10001 appuser
+RUN chmod 0644 checkin.py \
+    && useradd --create-home --uid 10001 appuser
 USER appuser
 
 ENTRYPOINT ["python", "checkin.py"]
