@@ -25,7 +25,6 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 .hypothesis/
-tests/
 
 # Packaging and build output
 build/

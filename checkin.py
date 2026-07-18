@@ -32,6 +32,7 @@ YNGAL_BASE_URL = "https://www.yngal.com/"
 YNGAL_LOGIN_URL = urljoin(YNGAL_BASE_URL, "sign")
 YNGAL_REWARD_URL = urljoin(YNGAL_BASE_URL, "addJf")
 DEFAULT_RETRY_DELAYS = (300, 900, 1800)
+DEFAULT_NOTIFICATION_RETRY_DELAYS = (2, 5)
 USER_AGENT = "KFCheckin/1.0 (+personal daily reward client)"
 YNGAL_USER_AGENT = "MultiSiteCheckin/1.0 (+personal daily reward client)"
 
@@ -40,6 +41,11 @@ class CheckinStatus(str, Enum):
     CLAIMED = "claimed"
     ALREADY_CLAIMED = "already_claimed"
     FAILED = "failed"
+
+
+class NotificationMode(str, Enum):
+    FAILURE = "failure"
+    ALL = "all"
 
 
 class RewardState(str, Enum):
@@ -96,10 +102,20 @@ class YngalConfig:
 
 
 @dataclass(frozen=True)
+class PushLiteConfig:
+    url: str
+    token: str
+    umo: str
+    mode: NotificationMode = NotificationMode.FAILURE
+    timeout: float = 10.0
+
+
+@dataclass(frozen=True)
 class AppConfig:
     forum: Config | None
     yngal: YngalConfig | None
     timezone: ZoneInfo
+    push_lite: PushLiteConfig | None = None
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -121,6 +137,20 @@ class AppConfig:
             raise ValueError("REQUEST_TIMEOUT 必须是秒数") from exc
         if timeout <= 0:
             raise ValueError("REQUEST_TIMEOUT 必须大于 0")
+
+        notification_mode_text = env.get("PUSH_LITE_NOTIFY_MODE", "failure").strip().lower()
+        try:
+            notification_mode = NotificationMode(notification_mode_text)
+        except ValueError as exc:
+            raise ValueError("PUSH_LITE_NOTIFY_MODE 必须是 failure 或 all") from exc
+
+        notification_timeout_text = env.get("PUSH_LITE_TIMEOUT", "10").strip()
+        try:
+            notification_timeout = float(notification_timeout_text)
+        except ValueError as exc:
+            raise ValueError("PUSH_LITE_TIMEOUT 必须是秒数") from exc
+        if notification_timeout <= 0:
+            raise ValueError("PUSH_LITE_TIMEOUT 必须大于 0")
 
         def parse_time(variable: str, default: str = "08:00") -> datetime_time:
             value = env.get(variable, default).strip()
@@ -160,7 +190,52 @@ class AppConfig:
                 parse_time("YNGAL_CHECKIN_TIME"),
                 timeout,
             )
-        return cls(forum, yngal, timezone)
+
+        push_values = {
+            "PUSH_LITE_URL": env.get("PUSH_LITE_URL", "").strip(),
+            "PUSH_LITE_TOKEN": env.get("PUSH_LITE_TOKEN", "").strip(),
+            "PUSH_LITE_UMO": env.get("PUSH_LITE_UMO", "").strip(),
+        }
+        configured_push_values = [
+            name for name, value in push_values.items() if value
+        ]
+        if configured_push_values and len(configured_push_values) != len(push_values):
+            raise ValueError(
+                "PUSH_LITE_URL、PUSH_LITE_TOKEN 和 PUSH_LITE_UMO 必须同时设置或同时留空"
+            )
+
+        push_lite = None
+        if configured_push_values:
+            push_url = push_values["PUSH_LITE_URL"]
+            parsed_url = urlparse(push_url)
+            try:
+                parsed_port = parsed_url.port
+            except ValueError as exc:
+                raise ValueError("PUSH_LITE_URL 包含无效端口") from exc
+            if (
+                parsed_url.scheme not in ("http", "https")
+                or parsed_url.hostname is None
+                or parsed_url.username is not None
+                or parsed_url.password is not None
+                or parsed_url.fragment
+                or not parsed_url.path.endswith("/send")
+                or (
+                    parsed_port is not None
+                    and not 1 <= parsed_port <= 65535
+                )
+            ):
+                raise ValueError(
+                    "PUSH_LITE_URL 必须是以 /send 结尾的有效 HTTP(S) 地址，"
+                    "且不能包含用户信息或片段"
+                )
+            push_lite = PushLiteConfig(
+                push_url,
+                push_values["PUSH_LITE_TOKEN"],
+                push_values["PUSH_LITE_UMO"],
+                notification_mode,
+                notification_timeout,
+            )
+        return cls(forum, yngal, timezone, push_lite)
 
 
 @dataclass(frozen=True)
@@ -176,6 +251,111 @@ class CheckinResult:
     message: str
     reward_text: str | None = None
     retryable: bool = False
+
+
+def format_notification_message(
+    site_name: str, result: CheckinResult, occurred_at: datetime
+) -> str:
+    if result.status is CheckinStatus.FAILED:
+        title = f"【签到失败告警】{site_name}"
+    else:
+        title = f"【签到成功】{site_name}"
+
+    lines = [
+        title,
+        f"时间：{occurred_at.isoformat(timespec='seconds')}",
+        f"结果：{result.message}",
+    ]
+    if result.reward_text:
+        lines.append(f"奖励：{result.reward_text}")
+    return "\n".join(lines)
+
+
+class PushLiteNotifier:
+    def __init__(
+        self,
+        config: PushLiteConfig,
+        *,
+        post: Callable[..., requests.Response] = requests.post,
+        sleep: Callable[[float], None] = time.sleep,
+        retry_delays: Iterable[int] = DEFAULT_NOTIFICATION_RETRY_DELAYS,
+        now: Callable[[ZoneInfo], datetime] = datetime.now,
+    ) -> None:
+        self.config = config
+        self.post = post
+        self.sleep = sleep
+        self.retry_delays = tuple(retry_delays)
+        self.now = now
+
+    def should_notify(self, result: CheckinResult) -> bool:
+        return (
+            result.status is CheckinStatus.FAILED
+            or self.config.mode is NotificationMode.ALL
+        )
+
+    def notify(
+        self,
+        site_name: str,
+        result: CheckinResult,
+        timezone: ZoneInfo,
+        logger: logging.Logger | logging.LoggerAdapter,
+    ) -> bool:
+        if not self.should_notify(result):
+            return True
+
+        content = format_notification_message(site_name, result, self.now(timezone))
+        delays = iter(self.retry_delays)
+        attempt = 1
+        while True:
+            accepted, retryable, reason = self._send_once(content)
+            if accepted:
+                logger.info("Push Lite 通知已进入发送队列")
+                return True
+
+            delay = next(delays, None) if retryable else None
+            if delay is None:
+                logger.error("Push Lite 通知发送失败：%s", reason)
+                return False
+
+            logger.warning(
+                "Push Lite 通知发送失败（第 %s 次），%s 秒后重试：%s",
+                attempt,
+                delay,
+                reason,
+            )
+            self.sleep(delay)
+            attempt += 1
+
+    def _send_once(self, content: str) -> tuple[bool, bool, str]:
+        try:
+            response = self.post(
+                self.config.url,
+                headers={"Authorization": f"Bearer {self.config.token}"},
+                json={
+                    "content": content,
+                    "umo": self.config.umo,
+                    "message_type": "text",
+                },
+                timeout=self.config.timeout,
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            return False, True, f"网络请求失败（{exc.__class__.__name__}）"
+        except requests.RequestException as exc:
+            return False, False, f"请求失败（{exc.__class__.__name__}）"
+
+        status_code = response.status_code
+        if status_code == 429 or status_code >= 500:
+            return False, True, f"HTTP {status_code}"
+        if not 200 <= status_code < 300:
+            return False, False, f"HTTP {status_code}"
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return False, False, "成功响应不是有效 JSON"
+        if not isinstance(payload, dict) or payload.get("status") != "queued":
+            return False, False, "成功响应缺少 queued 状态"
+        return True, False, ""
 
 
 class ForumError(RuntimeError):
@@ -554,6 +734,7 @@ def run_site_once(
     *,
     retry_delays: Iterable[int] = DEFAULT_RETRY_DELAYS,
     sleep: Callable[[float], None] = time.sleep,
+    notifier: PushLiteNotifier | None = None,
 ) -> CheckinResult:
     site_log = SiteLoggerAdapter(logger, job.name)
     try:
@@ -567,13 +748,25 @@ def run_site_once(
         site_log.exception("签到发生未处理异常：%s", exc.__class__.__name__)
         result = CheckinResult(CheckinStatus.FAILED, "签到发生未处理异常")
     log_result(result, site_log)
+    if notifier is not None:
+        try:
+            notifier.notify(job.name, result, job.timezone, site_log)
+        except Exception as exc:  # pragma: no cover - 通知不得影响签到任务
+            site_log.error("Push Lite 通知发生未处理异常：%s", exc.__class__.__name__)
     return result
 
 
-def run_all_once(jobs: list[SiteJob], logger: logging.Logger) -> dict[str, CheckinResult]:
+def run_all_once(
+    jobs: list[SiteJob],
+    logger: logging.Logger,
+    notifier: PushLiteNotifier | None = None,
+) -> dict[str, CheckinResult]:
     results: dict[str, CheckinResult] = {}
     with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="checkin") as executor:
-        futures = {executor.submit(run_site_once, job, logger): job.name for job in jobs}
+        futures = {
+            executor.submit(run_site_once, job, logger, notifier=notifier): job.name
+            for job in jobs
+        }
         for future in as_completed(futures):
             results[futures[future]] = future.result()
     return {job.name: results[job.name] for job in jobs}
@@ -585,7 +778,11 @@ def once_exit_code(results: Mapping[str, CheckinResult]) -> int:
     ) else 1
 
 
-def run_once(config: Config, logger: logging.Logger) -> CheckinResult:
+def run_once(
+    config: Config,
+    logger: logging.Logger,
+    notifier: PushLiteNotifier | None = None,
+) -> CheckinResult:
     """保留原有单站点调用入口，便于现有使用方平滑升级。"""
     job = SiteJob(
         "绯月",
@@ -593,17 +790,22 @@ def run_once(config: Config, logger: logging.Logger) -> CheckinResult:
         config.checkin_time,
         lambda site_log: ForumClient(config, logger=site_log).checkin(),
     )
-    return run_site_once(job, logger)
+    return run_site_once(job, logger, notifier=notifier)
 
 
-def _run_site_daemon(job: SiteJob, stop_event: threading.Event, logger: logging.Logger) -> None:
+def _run_site_daemon(
+    job: SiteJob,
+    stop_event: threading.Event,
+    logger: logging.Logger,
+    notifier: PushLiteNotifier | None = None,
+) -> None:
     site_log = SiteLoggerAdapter(logger, job.name)
     site_log.info(
         "任务启动；启动时立即检查，之后每天 %s %s 执行",
         job.timezone.key,
         job.checkin_time.strftime("%H:%M"),
     )
-    run_site_once(job, logger)
+    run_site_once(job, logger, notifier=notifier)
 
     while not stop_event.is_set():
         now = datetime.now(job.timezone)
@@ -612,12 +814,16 @@ def _run_site_daemon(job: SiteJob, stop_event: threading.Event, logger: logging.
         site_log.info("下次签到时间：%s", next_run.isoformat(timespec="minutes"))
         if stop_event.wait(seconds):
             break
-        run_site_once(job, logger)
+        run_site_once(job, logger, notifier=notifier)
 
     site_log.info("任务已停止")
 
 
-def run_daemon(config: AppConfig, logger: logging.Logger) -> None:
+def run_daemon(
+    config: AppConfig,
+    logger: logging.Logger,
+    notifier: PushLiteNotifier | None = None,
+) -> None:
     stop_event = threading.Event()
 
     def request_stop(signum: int, _frame: object) -> None:
@@ -632,7 +838,7 @@ def run_daemon(config: AppConfig, logger: logging.Logger) -> None:
     threads = [
         threading.Thread(
             target=_run_site_daemon,
-            args=(job, stop_event, logger),
+            args=(job, stop_event, logger, notifier),
             name=f"checkin-{job.name}",
         )
         for job in jobs
@@ -669,11 +875,13 @@ def main() -> int:
         logger.error("配置错误：%s", exc)
         return 2
 
+    notifier = PushLiteNotifier(config.push_lite) if config.push_lite is not None else None
+
     if args.mode == "once":
-        results = run_all_once(build_site_jobs(config), logger)
+        results = run_all_once(build_site_jobs(config), logger, notifier)
         return once_exit_code(results)
 
-    run_daemon(config, logger)
+    run_daemon(config, logger, notifier)
     return 0
 
 

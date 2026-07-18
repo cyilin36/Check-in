@@ -1,4 +1,4 @@
-name: kf-checkin
+name: checkin
 
 services:
   kf-checkin:
