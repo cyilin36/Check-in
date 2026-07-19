@@ -1,7 +1,7 @@
 name: checkin
 
 services:
-  kf-checkin:
+  checkin:
     build:
       context: .
     image: checkin:local

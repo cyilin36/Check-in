@@ -22,7 +22,7 @@
 3. 查看运行日志：
 
    ```bash
-   docker compose logs -f kf-checkin
+   docker compose logs -f checkin
    ```
 
 4. 停止服务：
@@ -38,7 +38,7 @@
 使用 Docker：
 
 ```bash
-docker compose run --rm kf-checkin once
+docker compose run --rm checkin once
 ```
 
 或使用本机 Python 3.11 及以上版本：
