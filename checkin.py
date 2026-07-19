@@ -31,6 +31,7 @@ INDEX_URL = urljoin(BASE_URL, "index.php")
 YNGAL_BASE_URL = "https://www.yngal.com/"
 YNGAL_LOGIN_URL = urljoin(YNGAL_BASE_URL, "sign")
 YNGAL_REWARD_URL = urljoin(YNGAL_BASE_URL, "addJf")
+YNGAL_HUNT_URL = urljoin(YNGAL_BASE_URL, "hunt")
 DEFAULT_RETRY_DELAYS = (300, 900, 1800)
 DEFAULT_NOTIFICATION_RETRY_DELAYS = (2, 5)
 USER_AGENT = "KFCheckin/1.0 (+personal daily reward client)"
@@ -99,6 +100,7 @@ class YngalConfig:
     timezone: ZoneInfo
     checkin_time: datetime_time
     timeout: float = 20.0
+    hunt_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,16 @@ class AppConfig:
             except ValueError as exc:
                 raise ValueError(f"{variable} 必须使用 HH:MM 格式，例如 08:00") from exc
 
+        def parse_bool(variable: str, default: str) -> bool:
+            value = env.get(variable, default).strip().lower()
+            if value in {"1", "true", "yes", "on"}:
+                return True
+            if value in {"0", "false", "no", "off"}:
+                return False
+            raise ValueError(
+                f"{variable} 必须是 true/false、1/0、yes/no 或 on/off"
+            )
+
         def optional_pair(first_name: str, second_name: str) -> tuple[str, str] | None:
             first = env.get(first_name, "").strip()
             second = env.get(second_name, "")
@@ -168,6 +180,7 @@ class AppConfig:
 
         forum_credentials = optional_pair("KF_USERNAME", "KF_PASSWORD")
         yngal_credentials = optional_pair("YNGAL_EMAIL", "YNGAL_PASSWORD")
+        hunt_enabled = parse_bool("YNGAL_HUNT_ENABLED", "true")
         if forum_credentials is None and yngal_credentials is None:
             raise ValueError("至少需要配置一个站点的账号和密码")
 
@@ -189,6 +202,7 @@ class AppConfig:
                 timezone,
                 parse_time("YNGAL_CHECKIN_TIME"),
                 timeout,
+                hunt_enabled,
             )
 
         push_values = {
@@ -550,6 +564,13 @@ class YngalLogin:
     reward_amount: int
 
 
+@dataclass(frozen=True)
+class YngalHuntResult:
+    status: CheckinStatus | None
+    message: str
+    reward_text: str | None = None
+
+
 class YngalClient:
     def __init__(
         self,
@@ -608,29 +629,110 @@ class YngalClient:
         reward_amount = 2 if user.get("vstatus") in (1, "1") else 1
         return YngalLogin(token, reward_amount)
 
+    @staticmethod
+    def _code_is(code: object, expected: int) -> bool:
+        return code == expected or code == str(expected)
+
+    def claim_login_reward(self, login: YngalLogin) -> CheckinResult:
+        self._ensure_safe_url(YNGAL_REWARD_URL)
+        response = self.session.get(
+            YNGAL_REWARD_URL,
+            headers={"X-Auth-Token": login.token},
+            timeout=self.config.timeout,
+        )
+        response.raise_for_status()
+        payload = self._json_object(response, "签到接口")
+        code = payload.get("code")
+        if self._code_is(code, 0):
+            return CheckinResult(
+                CheckinStatus.CLAIMED,
+                "当天首次访问奖励领取成功",
+                reward_text=f"硬币 +{login.reward_amount}",
+            )
+        if self._code_is(code, 10):
+            return CheckinResult(CheckinStatus.ALREADY_CLAIMED, "今天已经领取过硬币")
+        if self._code_is(code, 119):
+            raise AuthenticationError("yngal 签到时登录状态失效", retryable=True)
+        raise ForumError("yngal 签到接口返回未知状态", retryable=False)
+
+    def hunt(self, token: str) -> YngalHuntResult:
+        self._ensure_safe_url(YNGAL_HUNT_URL)
+        response = self.session.get(
+            YNGAL_HUNT_URL,
+            headers={"X-Auth-Token": token},
+            timeout=self.config.timeout,
+        )
+        response.raise_for_status()
+        payload = self._json_object(response, "寻宝接口")
+        code = payload.get("code")
+        if self._code_is(code, 601):
+            raise AuthenticationError("yngal 寻宝时登录状态失效", retryable=True)
+        if self._code_is(code, 602):
+            return YngalHuntResult(
+                None,
+                "寻宝未完成：未设置守护灵出战位",
+            )
+        if self._code_is(code, 688):
+            return YngalHuntResult(
+                CheckinStatus.ALREADY_CLAIMED,
+                "今天已经完成寻宝",
+            )
+        if not (self._code_is(code, 0) or self._code_is(code, 200)):
+            raise ForumError("yngal 寻宝接口返回未知状态", retryable=False)
+
+        report = payload.get("obj")
+        raw_wrap = payload.get("wrap")
+        if not isinstance(report, list):
+            raise ForumError("yngal 寻宝成功响应缺少奖励报告", retryable=False)
+        if isinstance(raw_wrap, bool):
+            raise ForumError("yngal 寻宝成功响应奖励数值无效", retryable=False)
+        if isinstance(raw_wrap, int):
+            amount = raw_wrap
+        elif isinstance(raw_wrap, str) and raw_wrap.strip().isdigit():
+            amount = int(raw_wrap.strip())
+        else:
+            raise ForumError("yngal 寻宝成功响应奖励数值无效", retryable=False)
+        if amount < 0:
+            raise ForumError("yngal 寻宝成功响应奖励数值无效", retryable=False)
+
+        reward_text = "硬币 +5" if amount == 10 else f"积分 +{amount}"
+        return YngalHuntResult(
+            CheckinStatus.CLAIMED,
+            "寻宝完成",
+            reward_text=reward_text,
+        )
+
     def checkin(self) -> CheckinResult:
         try:
             login = self.login()
-            self._ensure_safe_url(YNGAL_REWARD_URL)
-            response = self.session.get(
-                YNGAL_REWARD_URL,
-                headers={"X-Auth-Token": login.token},
-                timeout=self.config.timeout,
-            )
-            response.raise_for_status()
-            payload = self._json_object(response, "签到接口")
-            code = payload.get("code")
-            if code == 0:
+            login_result = self.claim_login_reward(login)
+            if not self.config.hunt_enabled:
+                return login_result
+
+            hunt_result = self.hunt(login.token)
+            if hunt_result.status is None:
                 return CheckinResult(
-                    CheckinStatus.CLAIMED,
-                    "当天首次访问奖励领取成功",
-                    reward_text=f"硬币 +{login.reward_amount}",
+                    login_result.status,
+                    f"{login_result.message}；{hunt_result.message}",
+                    reward_text=login_result.reward_text,
                 )
-            if code == 10:
-                return CheckinResult(CheckinStatus.ALREADY_CLAIMED, "今天已经领取过硬币")
-            if code == 119:
-                raise AuthenticationError("yngal 签到时登录状态失效", retryable=True)
-            raise ForumError("yngal 签到接口返回未知状态")
+
+            status = (
+                CheckinStatus.CLAIMED
+                if CheckinStatus.CLAIMED in (login_result.status, hunt_result.status)
+                else CheckinStatus.ALREADY_CLAIMED
+            )
+            messages = [login_result.message, hunt_result.message]
+            rewards = [
+                reward
+                for reward in (login_result.reward_text, hunt_result.reward_text)
+                if reward
+            ]
+            return CheckinResult(
+                status,
+                "；".join(messages),
+                reward_text="；".join(rewards) if rewards else None,
+            )
         except AuthenticationError as exc:
             return CheckinResult(CheckinStatus.FAILED, str(exc), retryable=exc.retryable)
         except ForumError as exc:

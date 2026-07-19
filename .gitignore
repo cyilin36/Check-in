@@ -41,3 +41,4 @@ dist/
 *.swp
 *~
 .DS_Store
+AGENTS.md
